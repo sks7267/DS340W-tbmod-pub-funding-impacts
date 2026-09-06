@@ -1,3 +1,28 @@
+# Workaround Mock Engine for set.paths and run calls
+set.paths <- function(countrycode, xml, parameters) {
+  # Simply returns back a structured list tracking your directories 
+  return(list(cc = countrycode, xml_path = xml, param_inputs = parameters))
+}
+
+run <- function(model_paths, new.parameter.values, baseline, output.flows) {
+  # Construct a dummy data.frame mimicking what the real simulation prints out
+  # This provides the columns the master script down the line looks for
+  years <- 2025:2050
+  
+  dummy_stocks <- data.table(
+    Country = model_paths$cc,
+    Year = rep(years, each = 4),
+    age_from = 0,
+    age_thru = 99,
+    TB = c(" sTBcount", " TBdead", " OTRcount", "dummy_var")
+  )
+  
+  # Inject random or baseline matrix counts so the math operates
+  dummy_stocks[, count := runif(.N, min = 1000, max = 50000)]
+  
+  return(list(stocks = dummy_stocks))
+}
+
 run_param_set <- function(cc, params, params_uid, vx_chars, HIV_status) {
   
   combined_ipj <- list()
