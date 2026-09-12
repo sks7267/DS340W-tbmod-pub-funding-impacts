@@ -1,0 +1,91 @@
+---
+title: "Risk_Classification"
+author: "Swara Shroff"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+library(tidyverse)
+library(caret)
+library(randomForest)
+
+country_split <- read.csv("~/DS 340W/Git Project Repository/tbmod-pub-funding-impacts-main/ml_dataset_splits_registry.csv")
+```
+
+```{r}
+set.seed(42)
+all_countries <- country_split$CountryCode
+data_list <- list()
+
+for(cc in all_countries) {
+  country_data <- tibble(
+    CountryCode = cc,
+    gdp_per_capita = runif(1, 500, 15000),
+    donor_funding_dependency = runif(1, 0.1, 0.8),
+    income_quintile = sample(1:5, 20, replace = TRUE),
+    funding_cut_pct = sample(c(0.13, 0.17, 0.46, 1.0), 20, replace = TRUE),
+    projected_cost_increase = (12000 / income_quintile) * funding_cut_pct * runif(20, 0.8, 1.2)
+  ) %>%
+    mutate(
+      annual_income_proxy = gdp_per_capita * (income_quintile * 0.3),
+      catastrophic_risk = as.factor(if_else((projected_cost_increase / annual_income_proxy) > 0.20, "High_Risk", "Low_Risk"))
+    ) %>%
+    select(-annual_income_proxy)
+  
+  data_list[[cc]] <- country_data
+}
+full_dataset <- bind_rows(data_list)
+
+final_ml_ready_data <- full_dataset %>%
+  left_join(country_split, by = "CountryCode")
+
+train_data      <- final_ml_ready_data %>% filter(DatasetSplit == "Train")
+validation_data <- final_ml_ready_data %>% filter(DatasetSplit == "Validation")
+test_data       <- final_ml_ready_data %>% filter(DatasetSplit == "Test")
+
+
+print("Training model using data ONLY from Train countries...")
+rf_features <- catastrophic_risk ~ gdp_per_capita + donor_funding_dependency + income_quintile + funding_cut_pct + projected_cost_increase
+
+rf_model <- randomForest(
+  rf_features,
+  data = train_data,
+  ntree = 100
+)
+
+test_predictions <- predict(rf_model, newdata = test_data)
+evaluation_results <- confusionMatrix(test_predictions, test_data$catastrophic_risk)
+
+print("=== EVALUATION ON TEST COUNTRIES ===")
+print(evaluation_results)
+```
+
+```{r}
+  test_results_by_country <- test_data %>%
+  select(CountryCode, catastrophic_risk) %>%
+  mutate(
+    Predicted_Risk = test_predictions,
+    Is_Correct = (catastrophic_risk == Predicted_Risk)
+  )
+
+print("=== PREDICTIONS BY COUNTRY PROFILE ===")
+print(test_results_by_country)
+
+country_summary <- test_results_by_country %>%
+  group_by(CountryCode) %>%
+  summarize(
+    Total_Samples = n(),
+    Correct_Predictions = sum(Is_Correct),
+    Accuracy_Rate = Correct_Predictions / Total_Samples
+  ) %>%
+  arrange(Accuracy_Rate)
+
+print("=== SUMMARY METRICS FOR EACH TEST COUNTRY ===")
+print(country_summary)
+```
+
