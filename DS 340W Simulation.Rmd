@@ -1,0 +1,212 @@
+---
+title: "DS 340W Code Simultation"
+author: "Swara Shroff and Felicia Vijayarangam"
+date: "2026-10-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ==========================================
+# UNIVERSAL TUBERCULOSIS FUNDING SHOCK PIPELINE
+# INTEGRATING: SKS7267 & LIU-YUETING DESIGN LOGIC
+# ==========================================
+
+# ------------------------------------------
+# 1. INITIALIZATION & DEPENDENCIES
+# ------------------------------------------
+required_packages <- c("tidyverse", "caret", "xgboost", "randomForest", 
+                       "missForest", "robustbase", "smotefamily", "pROC")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+library(tidyverse)    
+library(caret)        
+library(xgboost)      
+library(randomForest) 
+library(missForest)   
+library(robustbase)   
+library(smotefamily)   
+library(pROC)         
+
+set.seed(42)
+
+# ------------------------------------------
+# 2. DATA CONFIGURATION & SIMULATION ENGINE
+# ------------------------------------------
+generate_mock_integrated_data <- function(n_samples = 2000) {
+  countries <- paste0("Country_", 1:79) 
+  years <- 2020:2025
+  
+  data_records <- tibble(
+    country = sample(countries, n_samples, replace = TRUE),
+    year = sample(years, n_samples, replace = TRUE),
+    annual_income = rexp(n_samples, rate = 1/5000) + 500,
+    tb_cost = rexp(n_samples, rate = 1/1200) + 100,
+    
+    patient_age = sample(15:75, n_samples, replace = TRUE),
+    patient_sex = sample(c(0, 1), n_samples, replace = TRUE), 
+    drug_resistance_type = sample(c(0, 1, 2), n_samples, replace = TRUE), 
+    gdp_per_capita = runif(n_samples, 800, 12000),             
+    health_spending_per_capita = runif(n_samples, 50, 1500),   
+    
+    air_pollution_pm25 = runif(n_samples, 10, 90),
+    mdr_tb_incidence = runif(n_samples, 0.5, 15),
+    hiv_positive_tb_incidence = runif(n_samples, 1, 40),
+    life_expectancy = runif(n_samples, 50, 82),
+    cigarette_retail_price = runif(n_samples, 1.5, 12),
+    adult_hypertension_prevalence = runif(n_samples, 15, 45),
+    electricity_access_pct = runif(n_samples, 20, 100)
+  ) %>%
+  mutate(
+    is_catastrophic_cost = ifelse((tb_cost / annual_income) > 0.20, 1, 0)
+  )
+  
+  missing_cols <- c("air_pollution_pm25", "health_spending_per_capita", "electricity_access_pct")
+  for(col in missing_cols) {
+    data_records[sample(1:n_samples, n_samples * 0.05), col] <- NA
+  }
+  
+  return(data_records)
+}
+
+df_raw <- generate_mock_integrated_data()
+
+# ------------------------------------------
+# 3. PREPROCESSING AND ANALYSIS MATRIX
+# ------------------------------------------
+feature_cols <- c(
+  "patient_age", "patient_sex", "drug_resistance_type", "gdp_per_capita",
+  "health_spending_per_capita", "air_pollution_pm25", "mdr_tb_incidence",
+  "hiv_positive_tb_incidence", "life_expectancy", "cigarette_retail_price",
+  "adult_hypertension_prevalence", "electricity_access_pct"
+)
+target_col <- "is_catastrophic_cost"
+
+df_imputed <- df_raw %>% select(all_of(c(feature_cols, target_col))) %>% as.data.frame()
+imputation_results <- missForest(df_imputed, maxiter = 5, ntree = 50)
+df_processed <- imputation_results$ximp
+
+skewed_cols <- c("gdp_per_capita", "health_spending_per_capita", "mdr_tb_incidence", "hiv_positive_tb_incidence")
+for (col in skewed_cols) {
+  df_processed[[col]] <- log1p(df_processed[[col]])
+}
+
+pca_obj <- prcomp(df_processed[, feature_cols], scale. = TRUE)
+pca_scores <- pca_obj$x[, 1:3] 
+mcd_robust <- covMcd(pca_scores)
+mahal_dist <- mahalanobis(pca_scores, center = mcd_robust$center, cov = mcd_robust$cov)
+
+threshold <- quantile(mahal_dist, 0.95)
+df_filtered <- df_processed[mahal_dist <= threshold, ]
+
+scaler_pipeline <- preProcess(df_filtered[, feature_cols], method = c("center", "scale"))
+X_scaled <- predict(scaler_pipeline, df_filtered[, feature_cols])
+y <- df_filtered[[target_col]]
+
+smote_output <- SMOTE(X_scaled, y, K = 5, dup_size = 2)
+df_resampled <- smote_output$data
+
+X_matrix <- as.matrix(df_resampled[, feature_cols])
+y_vector <- as.numeric(df_resampled$class == "1")
+
+# ------------------------------------------
+# 4. K-FOLD EVALUATION LOOPS
+# ------------------------------------------
+folds <- createFolds(as.factor(y_vector), k = 10, returnTrain = TRUE)
+
+rf_auc <- c(); xgb_auc <- c(); base_auc <- c()
+rf_f1  <- c(); xgb_f1  <- c(); base_f1  <- c()
+
+for(i in 1:length(folds)) {
+  train_idx <- folds[[i]]
+  
+  X_train <- X_matrix[train_idx, ]; y_train <- y_vector[train_idx] 
+  X_val   <- X_matrix[-train_idx, ]; y_val   <- y_vector[-train_idx] 
+  
+  X_train_b <- as.matrix(X_train[, "gdp_per_capita", drop = FALSE])
+  X_val_b   <- as.matrix(X_val[, "gdp_per_capita", drop = FALSE])
+  
+  rf_model   <- randomForest(x = X_train, y = as.factor(y_train), ntree = 100)
+  base_model <- randomForest(x = X_train_b, y = as.factor(y_train), ntree = 100)
+  
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+  xgb_model <- xgb.train(params = list(objective = "binary:logistic"), 
+                         data = dtrain, 
+                         nrounds = 50, 
+                         verbose = 0)
+  
+  rf_prob   <- predict(rf_model, X_val, type = "prob")[, 2]
+  base_prob <- predict(base_model, X_val, type = "prob")[, 2]
+  xgb_prob  <- predict(xgb_model, X_val)
+  
+  rf_auc[i]   <- auc(roc(y_val, rf_prob, quiet=TRUE))
+  xgb_auc[i]  <- auc(roc(y_val, xgb_prob, quiet=TRUE))
+  base_auc[i] <- auc(roc(y_val, base_prob, quiet=TRUE))
+  
+  rf_f1[i]    <- confusionMatrix(as.factor(ifelse(rf_prob > 0.5, 1, 0)), as.factor(y_val))$byClass["F1"]
+  xgb_f1[i]   <- confusionMatrix(as.factor(ifelse(xgb_prob > 0.5, 1, 0)), as.factor(y_val))$byClass["F1"]
+  base_f1[i]  <- confusionMatrix(as.factor(ifelse(base_prob > 0.5, 1, 0)), as.factor(y_val))$byClass["F1"]
+}
+
+cat("\n--- 10-Fold Cross-Validation Performance Output Summary ---\n")
+cat(sprintf("Income Baseline Model -> Mean F1: %.3f | Mean AUC: %.3f\n", mean(base_f1, na.rm=TRUE), mean(base_auc)))
+cat(sprintf("Random Forest Model   -> Mean F1: %.3f | Mean AUC: %.3f\n", mean(rf_f1, na.rm=TRUE), mean(rf_auc)))
+cat(sprintf("XGBoost Classifier    -> Mean F1: %.3f | Mean AUC: %.3f\n\n", mean(xgb_f1, na.rm=TRUE), mean(xgb_auc)))
+
+# ------------------------------------------
+# 5. INTEGRATED FEATURE IMPORTANCE (NATIVE ENGINE)
+# ------------------------------------------
+dfinal <- xgb.DMatrix(data = X_matrix, label = y_vector)
+final_xgb <- xgb.train(params = list(objective = "binary:logistic"), 
+                       data = dfinal, 
+                       nrounds = 50, 
+                       verbose = 0)
+
+cat("--- Processing Native XGBoost Feature Importance Arrays ---\n")
+# FIXED: Using xgb.importance avoids all environment package discovery errors completely
+importance_matrix <- xgb.importance(feature_names = feature_cols, model = final_xgb)
+print(importance_matrix)
+
+# ------------------------------------------
+# 6. MACRO POLICY BUDGET SHOCK EXPERIMENTS
+# ------------------------------------------
+apply_funding_cut_scenarios <- function(base_dataframe, pre_process_model, final_classifier) {
+  
+  scenarios <- list(
+    "Scenario 0: Baseline Performance"                   = c(spend = 1.00, mdr = 1.00),
+    "Scenario 1: USAID Termination"                     = c(spend = 0.85, mdr = 1.05),
+    "Scenario 2: USAID Term + US Red. Global Fund"      = c(spend = 0.75, mdr = 1.10),
+    "Scenario 3: USAID Term + US Term. Global Fund"     = c(spend = 0.65, mdr = 1.15),
+    "Scenario 4: USAID Term + Reduced Global Fund"      = c(spend = 0.55, mdr = 1.25),
+    "Scenario 5: USAID Term + Major Donor Cut (1%+)"    = c(spend = 0.45, mdr = 1.35),
+    "Scenario 6: Complete External Funding Elimination" = c(spend = 0.20, mdr = 1.60)
+  )
+  
+  cat("\n--- Simulating Budget Shock Impacts on Household Catastrophic Risk Rates ---\n")
+  
+  for(name in names(scenarios)) {
+    simulated_df <- base_dataframe
+    shifts <- scenarios[[name]]
+    
+    simulated_df$health_spending_per_capita <- simulated_df$health_spending_per_capita * shifts["spend"]
+    simulated_df$mdr_tb_incidence           <- simulated_df$mdr_tb_incidence * shifts["mdr"]
+    
+    for (col in skewed_cols) {
+      simulated_df[[col]] <- log1p(simulated_df[[col]])
+    }
+    
+    sim_scaled <- predict(pre_process_model, simulated_df[, feature_cols])
+    predictions <- predict(final_classifier, as.matrix(sim_scaled))
+    predicted_risk_share <- mean(ifelse(predictions > 0.5, 1, 0)) * 100
+    
+    cat(sprintf("%-50s -> System Projected High-Risk Share: %.2f%%\n", name, predicted_risk_share))
+  }
+}
+
+apply_funding_cut_scenarios(df_filtered, scaler_pipeline, final_xgb)
+```
+
