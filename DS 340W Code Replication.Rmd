@@ -1,6 +1,6 @@
 ---
 title: "DS 340W Code Replication"
-author: "Swara Shroff"
+author: "Swara Shroff & Felicia Vijayarangam"
 date: "2026-11-08"
 output: html_document
 ---
