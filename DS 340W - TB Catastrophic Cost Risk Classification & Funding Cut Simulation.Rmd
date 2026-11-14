@@ -1,0 +1,432 @@
+---
+title: "DS 340W: TB Catastrophic Cost Risk Classification & Funding Cut Simulation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+rm(list = ls())
+library(tidyverse)
+library(countrycode)
+
+if (!dir.exists("results")) dir.create("results", recursive = TRUE)
+
+df_death      <- read.csv("data/death1.csv")
+df_risk_death <- read.csv("data/risk_deathall.csv")
+df_incidence  <- read.csv("data/incidence1.csv")
+df_pop        <- read.csv("data/population1.csv")
+df_le         <- read.csv("data/le.csv")
+
+df_gdp <- read_csv(
+  "C:/repo2/tbmod-pub-funding-impacts-main/Household_Economic_Burden/Inputs/countries_included.csv",
+  show_col_types = FALSE
+) %>%
+  select(iso3c = code, gdp_per_capita = GDPpc) %>%
+  distinct()
+
+death_clean <- df_death %>%
+  filter(year == 2021, metric_name == "Rate") %>%
+  select(location_id, location_name, sex_id, sex_name, age_id, age_name, cause_id, cause_name, Rate_tol_val = val)
+
+risk_clean <- df_risk_death %>%
+  filter(year == 2021, metric_name == "Rate") %>%
+  select(location_id, sex_id, age_id, cause_id, Rate_r_val = val)
+
+inc_clean <- df_incidence %>%
+  filter(year == 2021, metric_name == "Rate") %>%
+  select(location_id, sex_id, age_id, cause_id, Rate_in_val = val)
+
+pop_clean <- df_pop %>%
+  filter(year == 2021, metric_name == "Number") %>%
+  select(location_id, sex_id, age_id, pop_val = val) %>%
+  distinct()
+
+le_clean <- df_le %>%
+  filter(year == 2021, location_id == 1) %>%
+  select(sex_id, age_id, LE = val) %>%
+  distinct()
+
+data_econ <- death_clean %>%
+  left_join(risk_clean, by = c("location_id", "sex_id", "age_id", "cause_id")) %>%
+  left_join(inc_clean,  by = c("location_id", "sex_id", "age_id", "cause_id")) %>%
+  left_join(pop_clean,  by = c("location_id", "sex_id", "age_id")) %>%
+  left_join(le_clean,   by = c("sex_id", "age_id"))
+
+data_econ$iso3c <- countrycode(data_econ$location_name, origin = "country.name", destination = "iso3c", warn = FALSE)
+
+data_econ <- data_econ %>%
+  left_join(df_gdp, by = "iso3c") %>%
+  mutate(
+    gdp_per_capita = coalesce(gdp_per_capita, 10000),
+    Rate_r_val     = coalesce(Rate_r_val, 0),
+    Rate_in_val    = coalesce(Rate_in_val, 0),
+    LE             = coalesce(LE, 30),
+    AM_val         = pmax(Rate_tol_val - Rate_r_val, 0),
+    CFR_est        = ifelse(Rate_in_val > 0, Rate_tol_val / Rate_in_val, 0),
+    VSLY           = (gdp_per_capita * 100) / 40,
+    AM_Deaths_Num  = (AM_val / 100000) * pop_val,
+    Total_VLW      = AM_Deaths_Num * VSLY * LE
+  )
+
+write_csv(data_econ, "results/repo1_data_econ.csv")
+cat("Success! Saved results/repo1_data_econ.csv with", nrow(data_econ), "rows.\n")
+```
+
+
+## 1. Load Packages & Set Seed
+
+```{r load-packages}
+required_packages <- c(
+  "tidyverse", "caret", "randomForest", "xgboost",
+  "missForest", "smotefamily", "pROC", "countrycode", "WDI"
+)
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+set.seed(340)
+```
+
+## 2. Real Data Integration (Repo 1 + Repo 2 + World Bank WDI)
+
+```{r integrate-real-data}
+build_real_integrated_data <- function(
+    repo1_path = "results/repo1_data_econ.csv",
+    repo2_dir  = "C:/repo2/tbmod-pub-funding-impacts-main/Household_Economic_Burden/Inputs"
+) {
+  
+  # --- A. LOAD REPO 2: 79 LMICs & 5 WEALTH QUINTILE COSTS ---
+  countries_df <- read_csv(file.path(repo2_dir, "countries_included.csv"), show_col_types = FALSE) %>%
+    rename(iso3c = code)
+  
+  quintiles <- c("poorest", "poorer", "middle", "richer", "richest")
+  
+  quintile_costs <- map_dfr(seq_along(quintiles), function(q_idx) {
+    q <- quintiles[q_idx]
+    
+    dm  <- read_csv(file.path(repo2_dir, paste0("cost_dm_", q, "_pred_sets.csv")), show_col_types = FALSE)
+    nm  <- read_csv(file.path(repo2_dir, paste0("cost_nm_", q, "_pred_sets.csv")), show_col_types = FALSE)
+    ind <- read_csv(file.path(repo2_dir, paste0("cost_ind_", q, "_pred_sets.csv")), show_col_types = FALSE)
+    
+    tibble(
+      iso3c           = dm$iso3,
+      income_quintile = q_idx,
+      quintile_label  = q,
+      mean_dm_cost    = rowMeans(select(dm, starts_with("cost_dm_")), na.rm = TRUE),
+      mean_nm_cost    = rowMeans(select(nm, starts_with("cost_nm_")), na.rm = TRUE),
+      mean_ind_cost   = rowMeans(select(ind, starts_with("cost_ind_")), na.rm = TRUE)
+    ) %>%
+      mutate(base_tb_cost = mean_dm_cost + mean_nm_cost + mean_ind_cost)
+  })
+  
+  cc_empirical <- read_csv(file.path(repo2_dir, "cc_all.csv"), show_col_types = FALSE) %>%
+    group_by(code) %>%
+    summarise(across(starts_with("cc_"), ~ mean(., na.rm = TRUE)), .groups = "drop") %>%
+    pivot_longer(cols = starts_with("cc_"), names_to = "quintile_label", values_to = "empirical_cc_rate") %>%
+    mutate(quintile_label = str_remove(quintile_label, "^cc_")) %>%
+    rename(iso3c = code)
+  
+  repo2_merged <- countries_df %>%
+    inner_join(quintile_costs, by = "iso3c") %>%
+    left_join(cc_empirical, by = c("iso3c", "quintile_label")) %>%
+    mutate(
+      quintile_share = case_when(
+        income_quintile == 1 ~ 0.06,
+        income_quintile == 2 ~ 0.10,
+        income_quintile == 3 ~ 0.15,
+        income_quintile == 4 ~ 0.22,
+        income_quintile == 5 ~ 0.47
+      ),
+      annual_income = GDPpc * (quintile_share * 5)
+    )
+  
+  # --- B. LOAD REPO 1: GBD 2021 AGE, SEX & DRUG-RESISTANCE STRATA ---
+  repo1 <- read_csv(repo1_path, show_col_types = FALSE) %>%
+    mutate(
+      # Safely compute iso3c if not already present in repo1_data_econ.csv
+      iso3c = if ("iso3c" %in% names(.)) iso3c else countrycode(location_name, origin = "country.name", destination = "iso3c", warn = FALSE),
+      patient_age = case_when(
+        age_id == 1  ~ 2,  age_id == 6  ~ 7,  age_id == 7  ~ 12,
+        age_id == 8  ~ 17, age_id == 9  ~ 22, age_id == 10 ~ 27,
+        age_id == 11 ~ 32, age_id == 12 ~ 37, age_id == 13 ~ 42,
+        age_id == 14 ~ 47, age_id == 15 ~ 52, age_id == 16 ~ 57,
+        age_id == 17 ~ 62, age_id == 18 ~ 67, age_id == 19 ~ 72,
+        TRUE ~ 35
+      ),
+      patient_sex = ifelse(sex_id == 1, 1, 0),
+      drug_resistance_type = case_when(
+        cause_id == 934 ~ 0, # DS-TB
+        cause_id == 946 ~ 1, # MDR-TB
+        cause_id == 947 ~ 2, # XDR-TB
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    filter(!is.na(iso3c), !is.na(drug_resistance_type))
+  
+  mdr_country <- repo1 %>%
+    filter(drug_resistance_type == 1) %>%
+    group_by(iso3c) %>%
+    summarise(mdr_tb_incidence = mean(Rate_in_val, na.rm = TRUE), .groups = "drop")
+  
+  country_burden <- repo1 %>%
+    group_by(iso3c) %>%
+    summarise(
+      life_expectancy    = mean(LE, na.rm = TRUE),
+      amenable_mort_rate = mean(AM_val, na.rm = TRUE),
+      cfr_estimate       = mean(CFR_est, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # --- C. MERGE REPO 1 + REPO 2 & DEFINE TARGET VARIABLE ---
+  integrated_df <- repo2_merged %>%
+    inner_join(
+      repo1 %>% select(iso3c, patient_age, patient_sex, drug_resistance_type, Rate_in_val),
+      by = "iso3c",
+      relationship = "many-to-many"
+    ) %>%
+    left_join(mdr_country, by = "iso3c") %>%
+    left_join(country_burden, by = "iso3c") %>%
+    mutate(
+      gdp_per_capita             = GDPpc,
+      health_spending_per_capita = pmax(GDPpc * 0.055, mean_dm_cost * 1.5),
+      tb_cost = case_when(
+        drug_resistance_type == 1 ~ base_tb_cost * 2.5,
+        drug_resistance_type == 2 ~ base_tb_cost * 4.0,
+        TRUE ~ base_tb_cost
+      ),
+      is_catastrophic_cost = ifelse((tb_cost / annual_income) > 0.20, 1, 0)
+    ) %>%
+    slice_sample(n = 5000, weight_by = pmax(Rate_in_val, 0.01), replace = TRUE)
+  
+  return(integrated_df)
+}
+
+df_raw <- build_real_integrated_data()
+cat("Merged Dataset Dimensions:", nrow(df_raw), "rows x", ncol(df_raw), "columns\n")
+cat("Baseline Catastrophic Cost Rate:", round(mean(df_raw$is_catastrophic_cost) * 100, 2), "%\n")
+
+```
+
+## 3. Preprocessing & Outlier Pipeline
+
+```{r preprocessing}
+feature_cols <- c(
+  "patient_age", "patient_sex", "drug_resistance_type", "income_quintile",
+  "annual_income", "gdp_per_capita", "health_spending_per_capita",
+  "mdr_tb_incidence", "life_expectancy", "amenable_mort_rate",
+  "cfr_estimate", "mean_dm_cost", "mean_nm_cost", "mean_ind_cost"
+)
+
+skewed_cols <- c(
+  "annual_income", "gdp_per_capita", "health_spending_per_capita",
+  "mdr_tb_incidence", "amenable_mort_rate", "mean_dm_cost", "mean_ind_cost"
+)
+
+target_col <- "is_catastrophic_cost"
+
+# 1. Impute any missing values with missForest
+df_model_input <- df_raw %>% select(all_of(c(feature_cols, target_col))) %>% as.data.frame()
+df_model_input[[target_col]] <- as.factor(df_model_input[[target_col]])
+
+imp_out <- missForest(df_model_input, verbose = FALSE)
+df_imputed <- imp_out$ximp
+
+# 2. Log(1 + x) transformation on right-skewed features
+df_logged <- df_imputed
+for (col in skewed_cols) {
+  df_logged[[col]] <- log1p(pmax(df_logged[[col]], 0))
+}
+
+# 3. PCA + Mahalanobis Distance Outlier Removal
+pca_res <- prcomp(df_logged[, skewed_cols], scale. = TRUE)
+pca_scores <- pca_res$x[, 1:2]
+mahal_dist <- mahalanobis(pca_scores, colMeans(pca_scores), cov(pca_scores))
+df_filtered <- df_logged[mahal_dist < qchisq(0.999, df = 2), ]
+
+cat("Rows retained after Mahalanobis outlier filtering:", nrow(df_filtered), "\n")
+
+# 4. Stratified 70% Train / 10% Validation / 20% Test Split
+set.seed(340)
+train_idx <- createDataPartition(df_filtered[[target_col]], p = 0.70, list = FALSE)
+train_raw <- df_filtered[train_idx, ]
+temp_raw  <- df_filtered[-train_idx, ]
+
+# Split the remaining 30% into 1/3 Validation (10% of total) and 2/3 Test (20% of total)
+val_idx  <- createDataPartition(temp_raw[[target_col]], p = 1/3, list = FALSE)
+val_raw  <- temp_raw[val_idx, ]
+test_raw <- temp_raw[-val_idx, ]
+
+cat(sprintf("Split Sizes -> Train: %d (%.1f%%) | Validation: %d (%.1f%%) | Test: %d (%.1f%%)\n",
+            nrow(train_raw), nrow(train_raw)/nrow(df_filtered)*100,
+            nrow(val_raw),   nrow(val_raw)/nrow(df_filtered)*100,
+            nrow(test_raw),  nrow(test_raw)/nrow(df_filtered)*100))
+
+# 5. Z-Score Standardization (Fit ONLY on Train, apply to Val & Test)
+scaler_pipeline <- preProcess(train_raw[, feature_cols], method = c("center", "scale"))
+
+train_scaled <- predict(scaler_pipeline, train_raw[, feature_cols])
+val_scaled   <- predict(scaler_pipeline, val_raw[, feature_cols])
+test_scaled  <- predict(scaler_pipeline, test_raw[, feature_cols])
+
+train_scaled[[target_col]] <- train_raw[[target_col]]
+val_scaled[[target_col]]   <- val_raw[[target_col]]
+test_scaled[[target_col]]  <- test_raw[[target_col]]
+
+# 6. SMOTE Class Balancing on Training Data Only
+smote_out <- SMOTE(
+  X = train_scaled[, feature_cols],
+  target = as.numeric(as.character(train_scaled[[target_col]]))
+)
+train_balanced <- smote_out$data
+colnames(train_balanced)[ncol(train_balanced)] <- target_col
+train_balanced[[target_col]] <- as.factor(train_balanced[[target_col]])
+
+cat("Balanced Training Set Size after SMOTE:", nrow(train_balanced), "rows\n")
+```
+
+## 4. Model Training & 1-Fold Cross-Validation
+
+```{r}
+# ==============================================================================
+# 4. MODEL TRAINING & 10-FOLD CROSS-VALIDATION
+# ==============================================================================
+
+# --- A. Baseline Model (Income-Quintile & GDP-Only Logistic Regression) ---
+baseline_glm <- glm(
+  is_catastrophic_cost ~ income_quintile + gdp_per_capita,
+  data = train_balanced,
+  family = binomial()
+)
+
+# --- B. 10-Fold CV Random Forest ---
+train_rf_df <- train_balanced
+train_rf_df$target_factor <- factor(ifelse(train_rf_df[[target_col]] == "1", "Yes", "No"))
+
+cv_ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+rf_cv_model <- train(
+  x = train_rf_df[, feature_cols],
+  y = train_rf_df$target_factor,
+  method = "rf",
+  metric = "ROC",
+  trControl = cv_ctrl,
+  ntree = 300
+)
+
+# --- C. XGBoost Classifier ---
+dtrain <- xgb.DMatrix(
+  data = as.matrix(train_balanced[, feature_cols]),
+  label = as.numeric(as.character(train_balanced[[target_col]]))
+)
+dtest <- xgb.DMatrix(
+  data = as.matrix(test_scaled[, feature_cols]),
+  label = as.numeric(as.character(test_scaled[[target_col]]))
+)
+
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.05
+)
+
+final_xgb <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 300,
+  verbose = 0
+)
+
+# --- Evaluate All Three Models on Held-Out Test Set ---
+y_true <- as.numeric(as.character(test_scaled[[target_col]]))
+
+pred_base <- predict(baseline_glm, newdata = test_scaled, type = "response")
+pred_rf   <- predict(rf_cv_model,  newdata = test_scaled[, feature_cols], type = "prob")[, "Yes"]
+pred_xgb  <- predict(final_xgb,    newdata = dtest)
+
+calc_metrics <- function(probs, actual, model_name) {
+  preds <- ifelse(probs > 0.5, 1, 0)
+  cm <- confusionMatrix(factor(preds, levels = c(0, 1)), factor(actual, levels = c(0, 1)), positive = "1")
+  auc_val <- as.numeric(auc(roc(actual, probs, quiet = TRUE)))
+  rmse_val <- sqrt(mean((actual - probs)^2))
+  
+  tibble(
+    Model    = model_name,
+    Accuracy = round(cm$overall["Accuracy"], 4),
+    Recall   = round(cm$byClass["Recall"], 4),
+    F1_Score = round(cm$byClass["F1"], 4),
+    AUC_ROC  = round(auc_val, 4),
+    RMSE     = round(rmse_val, 4)
+  )
+}
+
+results_table <- bind_rows(
+  calc_metrics(pred_base, y_true, "Baseline (Income + GDP Only)"),
+  calc_metrics(pred_rf,   y_true, "Random Forest (10-Fold CV)"),
+  calc_metrics(pred_xgb,  y_true, "XGBoost Classifier")
+)
+
+print(results_table)
+
+# Feature Importance Plot
+imp_matrix <- xgb.importance(feature_names = feature_cols, model = final_xgb)
+xgb.plot.importance(imp_matrix, top_n = 10, main = "Top 10 Drivers of Catastrophic TB Costs (XGBoost)")
+```
+
+## 5. Funding-Cut Scenario Simulation
+```{r}
+apply_funding_cut_scenarios <- function(logged_dataframe, pre_process_model, final_classifier) {
+  
+  scenarios <- list(
+    "Scenario 0: Baseline Performance"                    = c(spend = 1.00, mdr = 1.00),
+    "Scenario 1: USAID Termination (scen_usaid)"          = c(spend = 0.85, mdr = 1.05),
+    "Scenario 2: USAID + US Red. GF (scen_usaid_USA_exp)" = c(spend = 0.75, mdr = 1.10),
+    "Scenario 3: USAID + US Term. GF (scen_usaid_USA)"    = c(spend = 0.65, mdr = 1.15),
+    "Scenario 4: USAID + Red. GF (scen_usaid_gf_exp)"     = c(spend = 0.55, mdr = 1.25),
+    "Scenario 5: Full External Cut (scen_usaid_gf)"       = c(spend = 0.25, mdr = 1.50)
+  )
+  
+  sim_summary <- map_dfr(names(scenarios), function(name) {
+    simulated_df <- logged_dataframe
+    for (col in skewed_cols) {
+      simulated_df[[col]] <- expm1(simulated_df[[col]])
+    }
+    
+    shifts <- scenarios[[name]]
+    simulated_df$health_spending_per_capita <- simulated_df$health_spending_per_capita * shifts["spend"]
+    simulated_df$mdr_tb_incidence           <- simulated_df$mdr_tb_incidence * shifts["mdr"]
+    
+    for (col in skewed_cols) {
+      simulated_df[[col]] <- log1p(simulated_df[[col]])
+    }
+    
+    sim_scaled <- predict(pre_process_model, simulated_df[, feature_cols])
+    preds <- predict(final_classifier, as.matrix(sim_scaled))
+    
+    tibble(
+      Scenario = name,
+      Projected_High_Risk_Share_Pct = round(mean(ifelse(preds > 0.5, 1, 0)) * 100, 2),
+      Mean_Predicted_Probability    = round(mean(preds) * 100, 2)
+    )
+  })
+  
+  return(sim_summary)
+}
+
+scenario_results <- apply_funding_cut_scenarios(df_filtered, scaler_pipeline, final_xgb)
+print(scenario_results)
+```
+
