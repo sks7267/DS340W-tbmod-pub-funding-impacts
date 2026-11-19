@@ -12,7 +12,6 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```{r load-packages}
 rm(list = ls())
 
-# --- 1. LOAD PACKAGES & SET SEED ---
 required_packages <- c(
   "tidyverse", "caret", "randomForest", "xgboost",
   "missForest", "smotefamily", "pROC", "countrycode"
@@ -92,7 +91,6 @@ cat("Saved results/repo1_data_econ.csv with", nrow(data_econ), "rows.\n")
 ## 3. Integrate Repo 1 + Repo 2 + Paper 3 (WHO / World Bank)
 
 ```{r integrate-real-data}
-# --- 3. INTEGRATE REPO 1 + REPO 2 + PAPER 3 (data/wdi_data.csv) ---
 build_real_integrated_data <- function(
     repo1_path  = "results/repo1_data_econ.csv",
     repo2_dir   = "Household_Economic_Burden/Inputs",
@@ -338,7 +336,6 @@ cat("Balanced Training Set Size after SMOTE:", nrow(train_balanced), "rows\n")
 
 ## 5. Model Training, 10-Fold Cross-Validation & SHAP
 ```{r modeling}
-# --- 5. MODEL TRAINING, 10-FOLD CROSS-VALIDATION & SHAP ---
 baseline_glm <- glm(
   is_catastrophic_cost ~ income_quintile + gdp_per_capita,
   data = train_balanced,
@@ -432,7 +429,6 @@ labs(
 
 ## 6. Six Funding-Cut Scenarios (Overall & By Country Income Group)
 ```{r scenarios}
-# --- 6. SIX FUNDING-CUT SCENARIOS (COUNTRY-SPECIFIC SHOCKS BY INCOME GROUP) ---
 apply_funding_cut_scenarios <- function(logged_dataframe, meta_df, pre_process_model, final_classifier) {
   
   scenario_cols <- c(
